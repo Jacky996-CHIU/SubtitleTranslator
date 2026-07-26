@@ -54,6 +54,7 @@ class JobResult:
     files: dict = field(default_factory=dict)
     quality: Optional[OCRQuality] = None
     qc: Optional[QCReport] = None
+    cover_windows: List[tuple] = field(default_factory=list)
     from_cache: bool = False
 
 
@@ -191,7 +192,8 @@ def run_job(
 
     report(1.0, "完成 / Done")
     return JobResult(segments=segments, files=files, quality=quality,
-                     qc=qc_report, from_cache=from_cache)
+                     qc=qc_report, cover_windows=cover_windows,
+                     from_cache=from_cache)
 
 
 def _default_cjk_font() -> str:

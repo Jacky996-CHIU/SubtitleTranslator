@@ -1,8 +1,15 @@
 """
-SubtitleTranslator — cross-platform desktop GUI (PySide6).
+AI Subtitle Studio — desktop GUI (PySide6).
 
-Recognizes burned-in captions in finished videos, translates them with DeepL,
-and exports bilingual SRT, a re-burned MP4, and a Word document.
+Recognizes burned-in English captions, translates them with DeepL, masks the
+originals and draws the translation in their place, then exports MP4 / SRT.
+
+The window follows the PRD's flow top to bottom:
+导入视频 → 目标语言 → 字幕样式 → 开始处理 → 预览 → 导出
+
+Processing is split in two so restyling is free: **分析** runs OCR + translation
+once (cached), **导出** only renders. Changing any style control repaints the
+preview immediately and never re-runs recognition or translation.
 """
 
 from __future__ import annotations
@@ -17,33 +24,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
-from subtrans.settings import Settings  # noqa: E402
 from subtrans.pipeline import JobConfig, run_job  # noqa: E402
+from subtrans.settings import Settings  # noqa: E402
+from subtrans.style import SubtitleStyle  # noqa: E402
+
+from preview import PreviewWidget  # noqa: E402
+from style_panel import StylePanel  # noqa: E402
 
 
-APP_NAME = "字幕翻译 · SubtitleTranslator"
+APP_NAME = "AI Subtitle Studio"
 
-# Static fallback list so the dropdown is populated before a key is verified.
-# The live list is refreshed from DeepL when a valid key is present.
-FALLBACK_TARGETS = [
-    ("ZH", "中文 Chinese (simplified)"), ("ZH-HANT", "中文繁體 Chinese (traditional)"),
-    ("EN-US", "English (American)"), ("EN-GB", "English (British)"),
-    ("JA", "日本語 Japanese"), ("KO", "한국어 Korean"),
-    ("DE", "Deutsch German"), ("FR", "Français French"),
-    ("ES", "Español Spanish"), ("IT", "Italiano Italian"),
-    ("PT-BR", "Português (BR)"), ("PT-PT", "Português (PT)"),
-    ("RU", "Русский Russian"), ("NL", "Nederlands Dutch"),
-    ("PL", "Polski Polish"), ("TR", "Türkçe Turkish"),
-    ("AR", "العربية Arabic"), ("ID", "Indonesian"), ("UK", "Ukrainian"),
-    ("CS", "Czech"), ("DA", "Danish"), ("FI", "Finnish"), ("EL", "Greek"),
-    ("HU", "Hungarian"), ("NB", "Norwegian"), ("RO", "Romanian"),
-    ("SK", "Slovak"), ("SV", "Swedish"), ("BG", "Bulgarian"),
+TARGETS = [
+    ("ZH", "中文（简体）"), ("ZH-HANT", "中文（繁體）"),
+    ("EN-US", "英语（美国）"), ("EN-GB", "英语（英国）"),
+    ("JA", "日语"), ("KO", "韩语"), ("DE", "德语"), ("FR", "法语"),
+    ("ES", "西班牙语"), ("IT", "意大利语"), ("PT-BR", "葡萄牙语（巴西）"),
+    ("PT-PT", "葡萄牙语（葡萄牙）"), ("RU", "俄语"), ("NL", "荷兰语"),
+    ("PL", "波兰语"), ("TR", "土耳其语"), ("AR", "阿拉伯语"),
+    ("ID", "印尼语"), ("UK", "乌克兰语"), ("CS", "捷克语"),
+    ("DA", "丹麦语"), ("FI", "芬兰语"), ("EL", "希腊语"),
+    ("HU", "匈牙利语"), ("NB", "挪威语"), ("RO", "罗马尼亚语"),
+    ("SK", "斯洛伐克语"), ("SV", "瑞典语"), ("BG", "保加利亚语"),
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def _fmt_time(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     m, s = divmod(seconds, 60)
@@ -53,113 +57,55 @@ def _fmt_time(seconds: float) -> str:
     return f"{int(m):02d}:{s:04.1f}"
 
 
-def _show_error_dialog(parent, msg: str):
-    """A bounded, scrollable, always-closable error dialog.
-
-    The old code passed the full ffmpeg stderr into QMessageBox, which grew the
-    dialog past the screen so its button was unreachable. This keeps a fixed
-    size with the details in a scroll area.
-    """
+def show_error(parent, msg: str):
+    """Bounded, scrollable, always-closable error dialog."""
     dlg = QtWidgets.QDialog(parent)
-    dlg.setWindowTitle(APP_NAME + " — 出错 / Error")
-    dlg.resize(680, 440)
+    dlg.setWindowTitle(APP_NAME + " — 出错")
+    dlg.resize(680, 420)
     lay = QtWidgets.QVBoxLayout(dlg)
-
-    head = QtWidgets.QLabel("处理时出错了。详情如下（可滚动、可复制）:")
+    head = QtWidgets.QLabel("处理时出错了，详情如下（可滚动、可复制）：")
     head.setStyleSheet("font-weight:700;")
     lay.addWidget(head)
-
     box = QtWidgets.QPlainTextEdit()
     box.setReadOnly(True)
     box.setPlainText(msg)
     box.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
     box.setStyleSheet("font-family:Menlo,Consolas,monospace;font-size:12px;")
     lay.addWidget(box, 1)
-
     btns = QtWidgets.QHBoxLayout()
-    copy_btn = QtWidgets.QPushButton("复制 / Copy")
-    copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(msg))
-    close_btn = QtWidgets.QPushButton("关闭 / Close")
-    close_btn.setDefault(True)
-    close_btn.clicked.connect(dlg.accept)
-    btns.addWidget(copy_btn)
+    cp = QtWidgets.QPushButton("复制")
+    cp.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(msg))
+    cl = QtWidgets.QPushButton("关闭")
+    cl.setDefault(True)
+    cl.clicked.connect(dlg.accept)
+    btns.addWidget(cp)
     btns.addStretch(1)
-    btns.addWidget(close_btn)
+    btns.addWidget(cl)
     lay.addLayout(btns)
-
     dlg.exec()
 
 
 # --------------------------------------------------------------------------- #
-# Worker
+# Workers
 # --------------------------------------------------------------------------- #
-class JobWorker(QtCore.QThread):
+class Worker(QtCore.QThread):
+    """Runs one run_job() call off the UI thread."""
+
     progress = QtCore.Signal(float, str)
-    log = QtCore.Signal(str)
-    file_done = QtCore.Signal(str, str)       # kind, path
-    captions = QtCore.Signal(str, list)       # video name, [(idx,start,end,orig,trans)]
-    video_done = QtCore.Signal(str)           # per-video finished
-    error = QtCore.Signal(str)
-    finished_all = QtCore.Signal()
+    done = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
 
-    def __init__(self, videos, base_cfg: dict, api_key: str):
+    def __init__(self, cfg: JobConfig):
         super().__init__()
-        self.videos = videos
-        self.base = base_cfg
-        self.api_key = api_key
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
+        self.cfg = cfg
 
     def run(self):
         try:
-            n = len(self.videos)
-            for i, vid in enumerate(self.videos):
-                if self._stop:
-                    break
-                self.log.emit(f"▶ [{i+1}/{n}] {os.path.basename(vid)}")
-                cfg = JobConfig(
-                    video_path=vid,
-                    target_lang=self.base["target_lang"],
-                    source_lang=self.base["source_lang"],
-                    api_key=self.api_key,
-                    ocr_engine=self._resolve_engine(),
-                    outputs=self.base["outputs"],
-                    srt_mode=self.base["srt_mode"],
-                    cover_original=self.base["cover_original"],
-                    out_dir=self.base["out_dir"],
-                    sample_fps=float(self.base["sample_fps"]),
-                )
-
-                def pcb(p, m, i=i):
-                    self.progress.emit((i + p) / n, m)
-
-                result = run_job(cfg, progress_cb=pcb)
-                rows = [
-                    (s.index, s.start, s.end, s.text, s.translation)
-                    for s in result.segments
-                ]
-                self.captions.emit(os.path.basename(vid), rows)
-                for kind, path in result.files.items():
-                    self.file_done.emit(kind, path)
-                self.log.emit(
-                    f"✓ 完成 {os.path.basename(vid)} — 识别 {len(result.segments)} 条字幕"
-                )
-                self.video_done.emit(vid)
-            self.finished_all.emit()
+            result = run_job(self.cfg, progress_cb=lambda p, m:
+                             self.progress.emit(p, m))
+            self.done.emit(result)
         except Exception as e:
-            self.error.emit(f"{e}\n\n{traceback.format_exc()}")
-
-    def _resolve_engine(self):
-        eng = self.base.get("engine", "auto")
-        if eng == "auto":
-            try:
-                import paddleocr  # noqa: F401
-                return "paddleocr"
-            except Exception:
-                return "tesseract"
-        return eng
+            self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -169,150 +115,133 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = Settings()
-        self.videos: list[str] = []
-        self.worker: JobWorker | None = None
+        self.video = ""
+        self.result = None
+        self.worker: Worker | None = None
         self.setWindowTitle(APP_NAME)
-        self.resize(920, 660)
+        self.resize(1180, 860)
         self._build_ui()
         self._load_settings()
 
-    # -- UI construction ----------------------------------------------------
+    # -- construction -------------------------------------------------------
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root = QtWidgets.QHBoxLayout(central)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(14)
+
+        # ---------- left: the flow ----------
+        left = QtWidgets.QVBoxLayout()
+        left.setSpacing(10)
 
         title = QtWidgets.QLabel(APP_NAME)
-        title.setStyleSheet("font-size:20px;font-weight:700;")
-        root.addWidget(title)
-        sub = QtWidgets.QLabel(
-            "识别视频里烧录的字幕 → DeepL 翻译 → 导出 SRT / 压制视频 / Word\n"
-            "Recognize burned-in captions → translate with DeepL → export SRT / video / Word"
-        )
-        sub.setStyleSheet("color:#666;")
-        root.addWidget(sub)
+        title.setStyleSheet("font-size:19px;font-weight:700;")
+        left.addWidget(title)
+        sub = QtWidgets.QLabel("识别硬字幕 → DeepL 翻译 → 覆盖原字幕 → 导出")
+        sub.setStyleSheet("color:#777;")
+        left.addWidget(sub)
 
-        # --- Videos drop zone
-        self.drop = DropList(self)
-        self.drop.filesDropped.connect(self.add_videos)
-        root.addWidget(self.drop, 1)
+        # 1 导入视频
+        g1 = self._group("1  导入视频")
+        v1 = QtWidgets.QVBoxLayout(g1)
+        self.file_lbl = QtWidgets.QLabel("尚未选择视频")
+        self.file_lbl.setWordWrap(True)
+        self.file_lbl.setStyleSheet("color:#555;")
+        pick = QtWidgets.QPushButton("选择视频…")
+        pick.clicked.connect(self.pick_video)
+        v1.addWidget(self.file_lbl)
+        v1.addWidget(pick)
+        left.addWidget(g1)
 
-        vbtns = QtWidgets.QHBoxLayout()
-        add_btn = QtWidgets.QPushButton("添加视频 / Add videos")
-        add_btn.clicked.connect(self.pick_videos)
-        clr_btn = QtWidgets.QPushButton("清空 / Clear")
-        clr_btn.clicked.connect(self.clear_videos)
-        vbtns.addWidget(add_btn)
-        vbtns.addWidget(clr_btn)
-        vbtns.addStretch(1)
-        root.addLayout(vbtns)
-
-        # --- Settings grid
-        form = QtWidgets.QGridLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
-        r = 0
-
-        form.addWidget(QtWidgets.QLabel("DeepL API 密钥:"), r, 0)
+        # 2 目标语言
+        g2 = self._group("2  目标语言与密钥")
+        f2 = QtWidgets.QGridLayout(g2)
+        f2.addWidget(QtWidgets.QLabel("目标语言"), 0, 0)
+        self.lang_combo = QtWidgets.QComboBox()
+        for code, name in TARGETS:
+            self.lang_combo.addItem(f"{name}", code)
+        f2.addWidget(self.lang_combo, 0, 1)
+        f2.addWidget(QtWidgets.QLabel("DeepL 密钥"), 1, 0)
         self.key_edit = QtWidgets.QLineEdit()
         self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.key_edit.setPlaceholderText("xxxxxxxx-xxxx-...  (:fx = 免费版)")
-        form.addWidget(self.key_edit, r, 1)
-        self.verify_btn = QtWidgets.QPushButton("验证密钥 / 刷新语言")
-        self.verify_btn.clicked.connect(self.verify_key)
-        form.addWidget(self.verify_btn, r, 2)
-        r += 1
+        self.key_edit.setPlaceholderText("以 :fx 结尾为免费版")
+        f2.addWidget(self.key_edit, 1, 1)
+        left.addWidget(g2)
 
-        form.addWidget(QtWidgets.QLabel("目标语言 / Target:"), r, 0)
-        self.lang_combo = QtWidgets.QComboBox()
-        for code, name in FALLBACK_TARGETS:
-            self.lang_combo.addItem(f"{name}  [{code}]", code)
-        form.addWidget(self.lang_combo, r, 1)
-        self.usage_lbl = QtWidgets.QLabel("")
-        self.usage_lbl.setStyleSheet("color:#888;")
-        form.addWidget(self.usage_lbl, r, 2)
-        r += 1
+        # 3 字幕样式
+        g3 = self._group("3  字幕样式")
+        v3 = QtWidgets.QVBoxLayout(g3)
+        self.style_panel = StylePanel()
+        self.style_panel.changed.connect(self.on_style_changed)
+        v3.addWidget(self.style_panel)
+        left.addWidget(g3)
 
-        form.addWidget(QtWidgets.QLabel("识别引擎 / OCR:"), r, 0)
-        self.engine_combo = QtWidgets.QComboBox()
-        self.engine_combo.addItem("自动 (有 PaddleOCR 则用，最高精度)", "auto")
-        self.engine_combo.addItem("Tesseract (轻量，内置)", "tesseract")
-        self.engine_combo.addItem("PaddleOCR (最高精度，需安装)", "paddleocr")
-        form.addWidget(self.engine_combo, r, 1)
-        r += 1
-
-        form.addWidget(QtWidgets.QLabel("输出 / Outputs:"), r, 0)
-        obox = QtWidgets.QHBoxLayout()
-        self.cb_srt = QtWidgets.QCheckBox("SRT 字幕")
-        self.cb_video = QtWidgets.QCheckBox("压制视频")
-        self.cb_docx = QtWidgets.QCheckBox("Word 文档")
-        for cb in (self.cb_srt, self.cb_video, self.cb_docx):
-            cb.setChecked(True)
-            obox.addWidget(cb)
-        obox.addStretch(1)
-        w = QtWidgets.QWidget(); w.setLayout(obox)
-        form.addWidget(w, r, 1, 1, 2)
-        r += 1
-
-        form.addWidget(QtWidgets.QLabel("SRT 样式:"), r, 0)
-        self.srt_combo = QtWidgets.QComboBox()
-        self.srt_combo.addItem("双语 (译文+原文) / bilingual", "bilingual")
-        self.srt_combo.addItem("仅译文 / translation", "translation")
-        self.srt_combo.addItem("仅原文 / original", "original")
-        form.addWidget(self.srt_combo, r, 1)
-        self.cb_cover = QtWidgets.QCheckBox("压制时遮盖原字幕 / cover original")
-        self.cb_cover.setChecked(True)
-        form.addWidget(self.cb_cover, r, 2)
-        r += 1
-
-        form.addWidget(QtWidgets.QLabel("输出目录 / Folder:"), r, 0)
-        self.out_edit = QtWidgets.QLineEdit()
-        form.addWidget(self.out_edit, r, 1)
-        out_btn = QtWidgets.QPushButton("选择…")
-        out_btn.clicked.connect(self.pick_outdir)
-        form.addWidget(out_btn, r, 2)
-        r += 1
-
-        root.addLayout(form)
-
-        # --- Run row
-        runrow = QtWidgets.QHBoxLayout()
-        self.run_btn = QtWidgets.QPushButton("开始 / Start")
-        self.run_btn.setStyleSheet(
+        # 4 开始处理
+        g4 = self._group("4  处理与导出")
+        v4 = QtWidgets.QVBoxLayout(g4)
+        self.analyze_btn = QtWidgets.QPushButton("开始处理（识别 + 翻译）")
+        self.analyze_btn.setStyleSheet(
             "QPushButton{background:#2d6cdf;color:white;font-weight:700;"
-            "padding:8px 22px;border-radius:6px;}"
-            "QPushButton:disabled{background:#9bb6e8;}")
-        self.run_btn.clicked.connect(self.start)
-        self.cancel_btn = QtWidgets.QPushButton("停止")
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self.cancel)
-        self.open_btn = QtWidgets.QPushButton("打开输出目录")
-        self.open_btn.clicked.connect(self.open_outdir)
-        runrow.addWidget(self.run_btn)
-        runrow.addWidget(self.cancel_btn)
-        runrow.addStretch(1)
-        runrow.addWidget(self.open_btn)
-        root.addLayout(runrow)
+            "padding:8px 16px;border-radius:6px;}"
+            "QPushButton:disabled{background:#a8c0ea;}")
+        self.analyze_btn.clicked.connect(self.start_analyze)
+        v4.addWidget(self.analyze_btn)
+
+        outrow = QtWidgets.QHBoxLayout()
+        self.cb_mp4 = QtWidgets.QCheckBox("MP4")
+        self.cb_mp4.setChecked(True)
+        self.cb_srt = QtWidgets.QCheckBox("SRT")
+        self.cb_srt.setChecked(True)
+        outrow.addWidget(QtWidgets.QLabel("导出："))
+        outrow.addWidget(self.cb_mp4)
+        outrow.addWidget(self.cb_srt)
+        outrow.addStretch(1)
+        v4.addLayout(outrow)
+
+        self.export_btn = QtWidgets.QPushButton("导出")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.start_export)
+        v4.addWidget(self.export_btn)
+
+        dirrow = QtWidgets.QHBoxLayout()
+        self.out_edit = QtWidgets.QLineEdit()
+        dirrow.addWidget(self.out_edit, 1)
+        d = QtWidgets.QPushButton("输出目录…")
+        d.clicked.connect(self.pick_outdir)
+        dirrow.addWidget(d)
+        v4.addLayout(dirrow)
+        left.addWidget(g4)
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 1000)
-        root.addWidget(self.progress)
-
-        self.status = QtWidgets.QLabel("就绪 / Ready")
+        left.addWidget(self.progress)
+        self.status = QtWidgets.QLabel("就绪")
         self.status.setStyleSheet("color:#555;")
-        root.addWidget(self.status)
+        left.addWidget(self.status)
+        left.addStretch(1)
 
-        # --- Results (captions table) + log, in tabs
+        leftw = QtWidgets.QWidget()
+        leftw.setLayout(left)
+        leftw.setFixedWidth(430)
+        root.addWidget(leftw)
+
+        # ---------- right: preview + results ----------
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(10)
+
+        g5 = self._group("5  预览（改样式即时生效）")
+        v5 = QtWidgets.QVBoxLayout(g5)
+        self.preview = PreviewWidget()
+        v5.addWidget(self.preview)
+        right.addWidget(g5, 3)
+
         self.tabs = QtWidgets.QTabWidget()
-
         self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(
-            ["#", "时间 Time", "原文 Original", "译文 Translation"])
+        self.table.setHorizontalHeaderLabels(["#", "时间", "原文", "译文"])
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(True)
         self.table.setAlternatingRowColors(True)
         hh = self.table.horizontalHeader()
@@ -320,261 +249,204 @@ class MainWindow(QtWidgets.QMainWindow):
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        self.tabs.addTab(self.table, "识别字幕 / Captions")
+        self.table.itemSelectionChanged.connect(self.on_row_selected)
+        self.tabs.addTab(self.table, "字幕")
+
+        self.qc_view = QtWidgets.QPlainTextEdit()
+        self.qc_view.setReadOnly(True)
+        self.tabs.addTab(self.qc_view, "质量检查")
 
         self.logview = QtWidgets.QPlainTextEdit()
         self.logview.setReadOnly(True)
-        self.tabs.addTab(self.logview, "日志 / Log")
+        self.tabs.addTab(self.logview, "日志")
+        right.addWidget(self.tabs, 2)
 
-        root.addWidget(self.tabs, 2)
+        root.addLayout(right, 1)
 
-    # -- settings load/save -------------------------------------------------
+    @staticmethod
+    def _group(title: str) -> QtWidgets.QGroupBox:
+        g = QtWidgets.QGroupBox(title)
+        g.setStyleSheet(
+            "QGroupBox{font-weight:600;border:1px solid #d5d5d5;border-radius:8px;"
+            "margin-top:8px;padding:10px 10px 8px 10px;}"
+            "QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 4px;}")
+        return g
+
+    # -- settings -----------------------------------------------------------
     def _load_settings(self):
         s = self.settings
         self.key_edit.setText(s["api_key"])
-        self._select_combo(self.lang_combo, s["target_lang"])
-        self._select_combo(self.engine_combo, s["engine"])
-        outs = s["outputs"]
-        self.cb_srt.setChecked("srt" in outs)
-        self.cb_video.setChecked("video" in outs)
-        self.cb_docx.setChecked("docx" in outs)
-        self._select_combo(self.srt_combo, s["srt_mode"])
-        self.cb_cover.setChecked(bool(s["cover_original"]))
-        self.out_edit.setText(s["out_dir"])
+        for i in range(self.lang_combo.count()):
+            if self.lang_combo.itemData(i) == s["target_lang"]:
+                self.lang_combo.setCurrentIndex(i)
+                break
+        self.out_edit.setText(s["out_dir"] or
+                              str(Path.home() / "SubtitleTranslator_Output"))
 
     def _save_settings(self):
         s = self.settings
         s["api_key"] = self.key_edit.text().strip()
         s["target_lang"] = self.lang_combo.currentData()
-        s["engine"] = self.engine_combo.currentData()
-        s["outputs"] = self._selected_outputs()
-        s["srt_mode"] = self.srt_combo.currentData()
-        s["cover_original"] = self.cb_cover.isChecked()
         s["out_dir"] = self.out_edit.text().strip()
         s.save()
 
-    @staticmethod
-    def _select_combo(combo, data):
-        for i in range(combo.count()):
-            if combo.itemData(i) == data:
-                combo.setCurrentIndex(i)
-                return
-
-    def _selected_outputs(self):
-        outs = []
-        if self.cb_srt.isChecked():
-            outs.append("srt")
-        if self.cb_video.isChecked():
-            outs.append("video")
-        if self.cb_docx.isChecked():
-            outs.append("docx")
-        return outs
-
-    # -- video list ---------------------------------------------------------
-    def pick_videos(self):
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "选择视频", "", "Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v)")
-        self.add_videos(files)
-
-    def add_videos(self, files):
-        for f in files:
-            if f and f not in self.videos:
-                self.videos.append(f)
-        self.drop.set_items(self.videos)
-
-    def clear_videos(self):
-        self.videos = []
-        self.drop.set_items(self.videos)
+    # -- inputs -------------------------------------------------------------
+    def pick_video(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择视频", "", "视频 (*.mp4 *.mov *.mkv *.avi *.webm *.m4v)")
+        if not path:
+            return
+        self.video = path
+        self.file_lbl.setText(os.path.basename(path))
+        self.result = None
+        self.export_btn.setEnabled(False)
+        self.table.setRowCount(0)
+        self.preview.segments = []
+        self.preview.cover_windows = []
+        self.preview.open(path)
+        self.status.setText("已导入视频，点“开始处理”")
 
     def pick_outdir(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "选择输出目录",
-                                                       self.out_edit.text())
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择输出目录", self.out_edit.text())
         if d:
             self.out_edit.setText(d)
 
-    def open_outdir(self):
-        d = self.out_edit.text().strip()
-        if d and os.path.isdir(d):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
-
-    # -- DeepL key verification --------------------------------------------
-    def verify_key(self):
-        key = self.key_edit.text().strip()
-        if not key:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "请先输入 DeepL API 密钥。")
-            return
-        try:
-            from subtrans.translate import DeepLTranslator
-            t = DeepLTranslator(key)
-            langs = t.target_languages()
-            cur = self.lang_combo.currentData()
-            self.lang_combo.clear()
-            for l in langs:
-                self.lang_combo.addItem(f"{l.name}  [{l.code}]", l.code)
-            self._select_combo(self.lang_combo, cur)
-            try:
-                u = t.usage()
-                if u.character.valid:
-                    self.usage_lbl.setText(
-                        f"用量 {u.character.count:,}/{u.character.limit:,} 字符")
-            except Exception:
-                pass
-            QtWidgets.QMessageBox.information(
-                self, APP_NAME, f"密钥有效，已载入 {len(langs)} 种目标语言。")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, APP_NAME, f"密钥验证失败:\n{e}")
+    # -- style --------------------------------------------------------------
+    def on_style_changed(self):
+        """PRD 十: restyle only repaints — no OCR, no DeepL, no re-render."""
+        self.preview.apply_style(self.style_panel.value())
 
     # -- run ----------------------------------------------------------------
-    def start(self):
-        if not self.videos:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "请先添加视频。")
-            return
-        outs = self._selected_outputs()
-        if not outs:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "请至少选择一种输出。")
-            return
-        key = self.key_edit.text().strip()
-        if not key:
-            QtWidgets.QMessageBox.warning(
-                self, APP_NAME, "请输入 DeepL API 密钥（翻译需要）。")
-            return
-        out_dir = self.out_edit.text().strip() or str(Path.home() / "SubtitleTranslator_Output")
+    def _base_cfg(self, outputs) -> JobConfig:
+        out_dir = self.out_edit.text().strip() or str(
+            Path.home() / "SubtitleTranslator_Output")
         os.makedirs(out_dir, exist_ok=True)
-        self._save_settings()
+        return JobConfig(
+            video_path=self.video,
+            target_lang=self.lang_combo.currentData(),
+            api_key=self.key_edit.text().strip(),
+            outputs=outputs,
+            srt_mode="bilingual",
+            burn_mode="translation",
+            cover_original=True,
+            removal_mode="cover",
+            style=self.style_panel.value(),
+            out_dir=out_dir,
+        )
 
-        base = {
-            "target_lang": self.lang_combo.currentData(),
-            "source_lang": self.settings["source_lang"],
-            "engine": self.engine_combo.currentData(),
-            "outputs": outs,
-            "srt_mode": self.srt_combo.currentData(),
-            "cover_original": self.cb_cover.isChecked(),
-            "out_dir": out_dir,
-            "sample_fps": self.settings["sample_fps"],
-        }
+    def start_analyze(self):
+        if not self.video:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "请先选择视频。")
+            return
+        if not self.key_edit.text().strip():
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "请输入 DeepL 密钥（翻译需要）。")
+            return
+        self._save_settings()
         self.logview.clear()
         self.table.setRowCount(0)
-        self.tabs.setCurrentIndex(0)
-        self.run_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
-        self.worker = JobWorker(list(self.videos), base, key)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.log.connect(self.on_log)
-        self.worker.file_done.connect(self.on_file_done)
-        self.worker.captions.connect(self.on_captions)
-        self.worker.error.connect(self.on_error)
-        self.worker.finished_all.connect(self.on_finished)
-        self.worker.start()
+        self._run(self._base_cfg([]), self.on_analyzed, "识别与翻译中…")
 
-    def cancel(self):
-        if self.worker:
-            self.worker.stop()
-            self.status.setText("正在停止…")
+    def start_export(self):
+        outs = (["video"] if self.cb_mp4.isChecked() else []) + \
+               (["srt"] if self.cb_srt.isChecked() else [])
+        if not outs:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "请至少选择一种导出格式。")
+            return
+        self._save_settings()
+        self._run(self._base_cfg(outs), self.on_exported, "导出中…")
+
+    def _run(self, cfg, on_done, status):
+        self.analyze_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.status.setText(status)
+        self.worker = Worker(cfg)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.done.connect(on_done)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
 
     def on_progress(self, p, msg):
         self.progress.setValue(int(p * 1000))
         self.status.setText(f"{msg}  ({p*100:.0f}%)")
 
-    def on_log(self, msg):
-        self.logview.appendPlainText(msg)
+    def on_analyzed(self, result):
+        self.result = result
+        self.analyze_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.fill_table(result.segments)
+        self.preview.segments = result.segments
+        self.preview.cover_windows = result.cover_windows
+        self.preview.apply_style(self.style_panel.value())
+        if result.quality:
+            self.logview.appendPlainText(result.quality.summary())
+        self.show_qc(result)
+        self.status.setText("处理完成 — 可在右侧预览，改样式即时生效")
 
-    def on_file_done(self, kind, path):
-        self.logview.appendPlainText(f"    → {kind}: {path}")
+    def on_exported(self, result):
+        self.analyze_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.progress.setValue(1000)
+        for kind, path in result.files.items():
+            self.logview.appendPlainText(f"{kind}: {path}")
+        self.show_qc(result)
+        self.status.setText("导出完成")
+        d = self.out_edit.text().strip()
+        if d and os.path.isdir(d):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
 
-    def on_captions(self, video_name, rows):
-        """Fill the results table with recognized text + translation."""
-        if self.table.rowCount() and len(self.videos) > 1:
-            self._add_section_row(video_name)
-        for idx, start, end, orig, trans in rows:
+    def on_failed(self, msg):
+        self.analyze_btn.setEnabled(True)
+        self.export_btn.setEnabled(bool(self.result))
+        self.status.setText("处理出错")
+        show_error(self, msg)
+
+    # -- results ------------------------------------------------------------
+    def fill_table(self, segments):
+        self.table.setRowCount(0)
+        for s in segments:
             r = self.table.rowCount()
             self.table.insertRow(r)
-            cells = [
-                str(idx),
-                f"{_fmt_time(start)}–{_fmt_time(end)}",
-                orig,
-                trans,
-            ]
-            for c, val in enumerate(cells):
+            for c, val in enumerate([str(s.index),
+                                     f"{_fmt_time(s.start)}–{_fmt_time(s.end)}",
+                                     s.text, s.translation]):
                 it = QtWidgets.QTableWidgetItem(val)
                 it.setToolTip(val)
-                if c in (0, 1):
-                    it.setTextAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
-                else:
-                    it.setTextAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+                it.setTextAlignment(QtCore.Qt.AlignTop |
+                                    (QtCore.Qt.AlignHCenter if c < 2
+                                     else QtCore.Qt.AlignLeft))
                 self.table.setItem(r, c, it)
         self.table.resizeRowsToContents()
-        self.tabs.setCurrentIndex(0)
 
-    def _add_section_row(self, video_name):
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        it = QtWidgets.QTableWidgetItem(f"▼ {video_name}")
-        f = it.font(); f.setBold(True); it.setFont(f)
-        it.setBackground(QtGui.QBrush(QtGui.QColor("#eef2fb")))
-        self.table.setItem(r, 0, it)
-        self.table.setSpan(r, 0, 1, 4)
+    def on_row_selected(self):
+        """Jump the preview to the selected caption."""
+        rows = self.table.selectionModel().selectedRows()
+        if not rows or not self.result:
+            return
+        i = rows[0].row()
+        if 0 <= i < len(self.result.segments):
+            seg = self.result.segments[i]
+            self.preview.seek_frame(int((seg.start + seg.end) / 2 *
+                                        self.preview._fps))
 
-    def on_error(self, msg):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.status.setText("出错 / Error")
-        _show_error_dialog(self, msg)
-
-    def on_finished(self):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.progress.setValue(1000)
-        self.status.setText("全部完成 / All done")
-        self.open_outdir()
+    def show_qc(self, result):
+        if not result.qc:
+            return
+        lines = [result.qc.summary(), ""]
+        lines += [str(f) for f in result.qc.findings]
+        self.qc_view.setPlainText("\n".join(lines))
+        if result.qc.errors:
+            self.tabs.setCurrentIndex(1)
 
     def closeEvent(self, ev):
         self._save_settings()
+        self.preview.close_video()
         super().closeEvent(ev)
-
-
-class DropList(QtWidgets.QListWidget):
-    filesDropped = QtCore.Signal(list)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setAlternatingRowColors(True)
-        self._placeholder()
-
-    def _placeholder(self):
-        self.clear()
-        it = QtWidgets.QListWidgetItem("拖拽视频到这里，或点“添加视频” / Drop videos here")
-        it.setForeground(QtGui.QBrush(QtGui.QColor("#999")))
-        it.setFlags(QtCore.Qt.NoItemFlags)
-        self.addItem(it)
-
-    def set_items(self, files):
-        self.clear()
-        if not files:
-            self._placeholder()
-            return
-        for f in files:
-            self.addItem(os.path.basename(f))
-
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dragMoveEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e):
-        exts = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
-        files = [u.toLocalFile() for u in e.mimeData().urls()
-                 if u.toLocalFile().lower().endswith(exts)]
-        if files:
-            self.filesDropped.emit(files)
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("SubtitleTranslator")
+    app.setApplicationName(APP_NAME)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

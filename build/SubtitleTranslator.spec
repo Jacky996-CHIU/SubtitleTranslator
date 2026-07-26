@@ -69,11 +69,13 @@ tessdata = _find_tessdata()
 if tessdata:
     datas.append((tessdata, "tessdata"))
 
-hiddenimports = collect_submodules("subtrans") + ["imageio_ffmpeg"]
+# The GUI modules sit next to app.py and are imported by bare name.
+hiddenimports = (collect_submodules("subtrans")
+                 + ["imageio_ffmpeg", "preview", "style_panel"])
 
 a = Analysis(
     ["../gui/app.py"],
-    pathex=[ROOT, os.path.dirname(ROOT)],
+    pathex=[ROOT, os.path.join(ROOT, "gui"), os.path.dirname(ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
