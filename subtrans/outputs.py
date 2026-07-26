@@ -75,7 +75,16 @@ def write_ass(
     border_style: int = 1,         # 1=outline+shadow, 3=opaque box (masks original)
     box_color: str = "&H00101010", # near-black box (used when border_style=3)
     outline_w: int = 2,
+    position_at_original: bool = True,
 ) -> str:
+    """Write an ASS subtitle file.
+
+    With ``position_at_original`` each caption is drawn centred on the box where
+    the original burned-in caption was detected (``Segment.orig_box``), and its
+    font is scaled to that box, so the translation replaces the original in
+    place instead of always sitting at the bottom of the frame. Segments without
+    a detected box fall back to the global style position.
+    """
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_res_x}
@@ -99,8 +108,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             body = s.translation or s.text
         body = body.replace("\n", "\\N")
+
+        tags = ""
+        if position_at_original and s.orig_box:
+            bx, by, bw, bh = s.orig_box
+            cx, cy = int(bx + bw / 2), int(by + bh / 2)
+            nlines = body.count("\\N") + 1
+            # Scale the text to the original caption's height so it reads like a
+            # replacement rather than an overlay.
+            fs = max(12, min(int(bh / max(1, nlines) * 0.78), play_res_y))
+            tags = f"{{\\an5\\pos({cx},{cy})\\fs{fs}}}"
+
         ev.append(
-            f"Dialogue: 0,{_ass_ts(s.start)},{_ass_ts(s.end)},Caption,,0,0,0,,{body}"
+            f"Dialogue: 0,{_ass_ts(s.start)},{_ass_ts(s.end)},Caption,,0,0,0,,{tags}{body}"
         )
     with open(path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(ev) + "\n")

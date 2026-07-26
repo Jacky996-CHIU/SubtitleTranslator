@@ -58,6 +58,10 @@ class ExtractConfig:
     merge_similarity: float = 0.6    # >= this ratio => same caption
     min_duration: float = 0.5        # drop segments shorter than this (s)
     diff_threshold: float = 0.02     # caption-region change fraction to re-OCR
+    # Reusing a previous frame's OCR result for visually similar frames is
+    # faster but loses caption lines that were missed on the first frame of a
+    # caption. Accuracy is P0, so this is off by default.
+    reuse_similar_frames: bool = False
 
 
 class SubtitleExtractor:
@@ -113,7 +117,15 @@ class SubtitleExtractor:
                                               prev_sig.astype(np.int16))) / 255.0
                     else:
                         diff = 1.0
-                    if diff < self.cfg.diff_threshold and prev_sig is not None:
+                    # Accuracy over speed (PRD P0): re-OCR every sampled frame.
+                    # Reusing the previous frame's result poisoned whole
+                    # captions — if the first frame of a caption was only
+                    # partially detected (e.g. during a fade-in), every later
+                    # "similar" frame reused that partial text and the missing
+                    # line could never be recovered by the vote.
+                    if (self.cfg.reuse_similar_frames
+                            and diff < self.cfg.diff_threshold
+                            and prev_sig is not None):
                         lines = prev_lines          # reuse — caption unchanged
                         boxes = prev_boxes
                     else:

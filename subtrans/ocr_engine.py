@@ -70,6 +70,16 @@ class OCRConfig:
     upscale: int = 3
     # Minimum mean per-line OCR confidence (0..100) to accept a caption line.
     min_conf: float = 62.0
+    # A reading at/above this confidence is trusted immediately, skipping any
+    # remaining second-pass binarizations.
+    good_conf: float = 88.0
+    # Per-word confidence floor; words below this are treated as OCR noise.
+    min_word_conf: float = 45.0
+    # Pre-OCR image enhancement (PRD: 去噪 / 对比度 / Gamma / 锐化 / 缩放).
+    denoise: bool = True
+    clahe: bool = True
+    sharpen: bool = True
+    gamma: float = 1.1
     # If True, prefer/keep upper-case style captions and reject mostly
     # lower-case fragments (typical of background logos / UI chrome). Marketing
     # captions like these are all-caps; general subtitles may not be, so this
@@ -86,6 +96,9 @@ class BaseOCR:
         # recent detect_lines() call, in frame pixel coords. Used to mask the
         # original burned-in caption when re-rendering the video.
         self.last_boxes: List[tuple] = []
+        # Per-line confidences of every accepted line, accumulated across the
+        # whole video, so a quality score can be reported (PRD: OCR 质量评分).
+        self.last_confidences: List[float] = []
 
     def detect_lines(self, frame_bgr: np.ndarray) -> List[str]:  # pragma: no cover
         raise NotImplementedError
@@ -153,6 +166,11 @@ class TesseractOCR(BaseOCR):
                 cf = float(c)
             except ValueError:
                 cf = -1.0
+            # Drop low-confidence fragments outright: those are the stray commas
+            # and duplicated digits a second-pass binarization can hallucinate
+            # (e.g. ", ONE-CLICK" or "11080P").
+            if cf < self.config.min_word_conf:
+                continue
             if cf >= 0:
                 words.append(t)
                 confs.append(cf)
@@ -174,6 +192,51 @@ class TesseractOCR(BaseOCR):
                 return False
         return True
 
+    def _enhance(self, crop: np.ndarray) -> np.ndarray:
+        """Denoise → contrast (CLAHE) → gamma → upscale → sharpen.
+
+        Captions here are small (source is often 640x360), so upscaling before
+        recognition matters more than anything else; the rest recovers glyph
+        edges on bright or cluttered backgrounds.
+        """
+        cfg = self.config
+        img = crop
+        if cfg.denoise:
+            img = cv2.bilateralFilter(img, 5, 40, 40)
+        if cfg.clahe:
+            img = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(img)
+        if cfg.gamma and cfg.gamma != 1.0:
+            inv = 1.0 / cfg.gamma
+            lut = np.array([((i / 255.0) ** inv) * 255 for i in range(256)], np.uint8)
+            img = cv2.LUT(img, lut)
+        img = cv2.resize(img, None, fx=cfg.upscale, fy=cfg.upscale,
+                         interpolation=cv2.INTER_CUBIC)
+        if cfg.sharpen:
+            blur = cv2.GaussianBlur(img, (0, 0), 1.2)
+            img = cv2.addWeighted(img, 1.6, blur, -0.6, 0)
+        return img
+
+    def _passes(self, crop: np.ndarray) -> List[np.ndarray]:
+        """Binary images to recognize, cheapest-and-cleanest first.
+
+        Pass 1 is a plain upscale + fixed white threshold: captions are bright
+        bold text, and on the usual dark backgrounds this gives the cleanest
+        glyphs. Enhancement (CLAHE/sharpen) is deliberately NOT used here — it
+        amplifies background speckle into phantom characters like the leading
+        "1" in "11080P".
+
+        Pass 2 (only reached when pass 1 fails to produce an acceptable line)
+        enhances and uses Otsu, which recovers captions on bright or
+        low-contrast scenes.
+        """
+        cfg = self.config
+        plain = cv2.resize(crop, None, fx=cfg.upscale, fy=cfg.upscale,
+                           interpolation=cv2.INTER_CUBIC)
+        _, p1 = cv2.threshold(plain, cfg.white_threshold, 255, cv2.THRESH_BINARY)
+        _, p2 = cv2.threshold(self._enhance(crop), 0, 255,
+                              cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        return [p1, p2]
+
     def detect_lines(self, frame_bgr: np.ndarray) -> List[str]:
         cfg = self.config
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -185,15 +248,27 @@ class TesseractOCR(BaseOCR):
             y0, x0 = max(0, y - pad), max(0, x - pad)
             y1, x1 = min(H, y + h + pad), min(W, x + w + pad)
             crop = gray[y0:y1, x0:x1]
-            crop = cv2.resize(
-                crop, None, fx=cfg.upscale, fy=cfg.upscale, interpolation=cv2.INTER_CUBIC
-            )
-            _, cth = cv2.threshold(crop, cfg.white_threshold, 255, cv2.THRESH_BINARY)
-            cth = cv2.copyMakeBorder(cth, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=0)
-            txt, conf = self._ocr_line(cth)
-            if self._caption_ok(txt, conf):
-                out.append(txt)
+
+            # Second-pass recognition (PRD: OCR 二次识别). The fixed white
+            # threshold is tried first because it yields the cleanest glyphs on
+            # the dark backgrounds captions usually sit on; the adaptive pass is
+            # only a fallback for bright/低对比 scenes. Picking the globally
+            # most-confident reading instead made things worse — the adaptive
+            # pass hallucinates confident junk like "11080P".
+            best_txt, best_conf = "", -1.0
+            for cand in self._passes(crop):
+                cand = cv2.copyMakeBorder(cand, 16, 16, 16, 16,
+                                          cv2.BORDER_CONSTANT, value=0)
+                txt, conf = self._ocr_line(cand)
+                if conf > best_conf:
+                    best_txt, best_conf = txt, conf
+                if self._caption_ok(txt, conf):
+                    best_txt, best_conf = txt, conf
+                    break            # good enough — don't risk a noisier pass
+            if self._caption_ok(best_txt, best_conf):
+                out.append(best_txt)
                 boxes.append((int(x), int(y), int(w), int(h)))
+                self.last_confidences.append(best_conf)
         self.last_boxes = boxes
         return out
 
