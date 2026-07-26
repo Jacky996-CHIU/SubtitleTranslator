@@ -3,3 +3,7 @@ dist/
 build/_work/
 __pycache__/
 *.pyc
+
+# local build log & editor/agent settings
+build/_build.log
+.claude/
