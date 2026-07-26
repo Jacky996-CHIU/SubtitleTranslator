@@ -76,6 +76,8 @@ def write_ass(
     box_color: str = "&H00101010", # near-black box (used when border_style=3)
     outline_w: int = 2,
     position_at_original: bool = True,
+    shadow: int = 1,
+    force_bottom_top: bool = False,
 ) -> str:
     """Write an ASS subtitle file.
 
@@ -94,7 +96,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,{font},{font_size},{primary},{outline},{box_color},{bold},0,0,0,100,100,0,0,{border_style},{outline_w},1,{alignment},{margin_l},20,{margin_v},1
+Style: Caption,{font},{font_size},{primary},{outline},{box_color},{bold},0,0,0,100,100,0,0,{border_style},{outline_w},{shadow},{alignment},{margin_l},20,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -110,7 +112,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         body = body.replace("\n", "\\N")
 
         tags = ""
-        if position_at_original and s.orig_box:
+        if position_at_original and s.orig_box and not force_bottom_top:
             bx, by, bw, bh = s.orig_box
             cx, cy = int(bx + bw / 2), int(by + bh / 2)
             nlines = body.count("\\N") + 1
@@ -250,19 +252,39 @@ def burn_video(
     fonts_dir: Optional[str] = None,
     cover_original: bool = True,
     progress_cb=None,
+    style=None,
+    audio_from: Optional[str] = None,
+    encoder: Optional[str] = None,
 ) -> str:
     """Render a new MP4 with the (translated) captions burned in.
 
     When ``cover_original`` is True, the original burned-in caption is masked
     with a fill box (using the detected bounding box) before the translated
     caption is drawn, so the result shows only the translation.
+
+    ``audio_from`` supplies the audio track from a different file, which the
+    inpainting path needs because its intermediate video carries no audio.
+    ``style`` is a :class:`subtrans.style.SubtitleStyle` overriding appearance.
     """
     w, h = _probe_dims(video_in)
-    fs = font_size or max(18, int(h * 0.062))
     ass_file = os.path.join(workdir, "burn.ass")
-    # When covering the original we align to bottom-left over the masked area.
-    write_ass(segments, ass_file, mode=mode, font=font, font_size=fs,
-              play_res_x=w, play_res_y=h)
+
+    if style is not None:
+        fs = style.resolved_font_size(h)
+        write_ass(segments, ass_file, mode=mode,
+                  font=style.font or font, font_size=fs,
+                  play_res_x=w, play_res_y=h,
+                  primary=style.primary_ass, outline=style.outline_ass,
+                  box_color=style.back_ass, border_style=style.border_style,
+                  outline_w=style.outline_width, shadow=style.shadow,
+                  bold=-1 if style.bold else 0,
+                  alignment=style.alignment, margin_v=style.margin_v,
+                  position_at_original=(style.position == "original"),
+                  force_bottom_top=(style.position != "original"))
+    else:
+        fs = font_size or max(18, int(h * 0.062))
+        write_ass(segments, ass_file, mode=mode, font=font, font_size=fs,
+                  play_res_x=w, play_res_y=h)
 
     # Run ffmpeg from the workdir and reference the subtitle file by its bare
     # name. A relative name has no "/" or ":" so it sidesteps ffmpeg's brittle
@@ -287,15 +309,21 @@ def burn_video(
 
     ffmpeg = ffmpeg_with_subtitles()   # raises a clear error if none can burn
 
+    vcodec = encoder or "libx264"
     last_err = ""
     for sub in sub_variants:
         vf = (cover + "," + sub) if cover else sub
-        cmd = [
-            ffmpeg, "-y", "-i", os.path.abspath(video_in),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-c:a", "copy", os.path.abspath(video_out),
-        ]
+        cmd = [ffmpeg, "-y", "-i", os.path.abspath(video_in)]
+        if audio_from:
+            # Video from the (inpainted) input, audio from the original file.
+            cmd += ["-i", os.path.abspath(audio_from),
+                    "-map", "0:v:0", "-map", "1:a:0?", "-shortest"]
+        cmd += ["-vf", vf, "-c:v", vcodec]
+        if vcodec == "libx264":
+            cmd += ["-preset", "medium", "-crf", "20"]
+        else:
+            cmd += ["-b:v", "0", "-q:v", "50"]     # hardware encoders
+        cmd += ["-c:a", "copy", os.path.abspath(video_out)]
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
         if proc.returncode == 0:
             return video_out

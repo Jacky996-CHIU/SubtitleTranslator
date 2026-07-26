@@ -11,7 +11,9 @@ from typing import Callable, List, Optional
 from .cache import Cache
 from .extractor import SubtitleExtractor, Segment, ExtractConfig
 from .ocr_engine import OCRConfig, build_engine
+from .inpaint import remove_hardsubs
 from .ocr_postprocess import OCRQuality, score_captions
+from .style import SubtitleStyle
 from . import outputs
 
 
@@ -37,6 +39,9 @@ class JobConfig:
     sample_fps: float = 4.0
     use_cache: bool = True                 # PRD 十三: 改样式不得重跑 OCR/DeepL
     cache_dir: Optional[str] = None
+    removal_mode: str = "cover"            # cover | inpaint (PRD 八 AI 去字幕)
+    style: Optional[SubtitleStyle] = None  # PRD 九 字幕样式
+    encoder: Optional[str] = None          # None = libx264, else HW encoder
 
 
 @dataclass
@@ -124,16 +129,37 @@ def run_job(
         files["docx"] = docx_path
 
     if "video" in cfg.outputs:
-        report(0.9, "压制视频 / Burning video")
         font = cfg.burn_font
         fonts_dir = cfg.fonts_dir
         if cfg.target_lang.upper() in CJK_TARGETS and font == "Arial":
             font = _default_cjk_font()
+
+        style = cfg.style
+        if style is not None and not style.font:
+            style.font = font
+
         vid_path = os.path.join(cfg.out_dir, f"{base}.{tl}.mp4")
-        outputs.burn_video(cfg.video_path, segments, vid_path, workdir,
+
+        # AI 去字幕: 重绘模式先把原字幕笔画抹掉并重建背景，再叠加译文；
+        # 覆盖模式直接用 drawbox 遮住原字幕。
+        source_video = cfg.video_path
+        audio_from = None
+        cover = cfg.cover_original
+        if cfg.removal_mode == "inpaint":
+            report(0.9, "去除原字幕 / Removing original captions")
+            clean = os.path.join(workdir, "clean.mp4")
+            remove_hardsubs(cfg.video_path, clean, segments,
+                            progress_cb=lambda p, m: report(0.9 + 0.05 * p, m))
+            source_video = clean
+            audio_from = cfg.video_path      # intermediate has no audio
+            cover = False                    # already removed
+
+        report(0.95, "压制视频 / Burning video")
+        outputs.burn_video(source_video, segments, vid_path, workdir,
                            mode=cfg.burn_mode, font=font,
                            font_size=cfg.burn_font_size, fonts_dir=fonts_dir,
-                           cover_original=cfg.cover_original)
+                           cover_original=cover, style=style,
+                           audio_from=audio_from, encoder=cfg.encoder)
         files["video"] = vid_path
 
     report(1.0, "完成 / Done")
