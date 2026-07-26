@@ -42,12 +42,62 @@ FALLBACK_TARGETS = [
 
 
 # --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _fmt_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(int(m), 60)
+    if h:
+        return f"{h}:{int(m):02d}:{s:04.1f}"
+    return f"{int(m):02d}:{s:04.1f}"
+
+
+def _show_error_dialog(parent, msg: str):
+    """A bounded, scrollable, always-closable error dialog.
+
+    The old code passed the full ffmpeg stderr into QMessageBox, which grew the
+    dialog past the screen so its button was unreachable. This keeps a fixed
+    size with the details in a scroll area.
+    """
+    dlg = QtWidgets.QDialog(parent)
+    dlg.setWindowTitle(APP_NAME + " — 出错 / Error")
+    dlg.resize(680, 440)
+    lay = QtWidgets.QVBoxLayout(dlg)
+
+    head = QtWidgets.QLabel("处理时出错了。详情如下（可滚动、可复制）:")
+    head.setStyleSheet("font-weight:700;")
+    lay.addWidget(head)
+
+    box = QtWidgets.QPlainTextEdit()
+    box.setReadOnly(True)
+    box.setPlainText(msg)
+    box.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+    box.setStyleSheet("font-family:Menlo,Consolas,monospace;font-size:12px;")
+    lay.addWidget(box, 1)
+
+    btns = QtWidgets.QHBoxLayout()
+    copy_btn = QtWidgets.QPushButton("复制 / Copy")
+    copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(msg))
+    close_btn = QtWidgets.QPushButton("关闭 / Close")
+    close_btn.setDefault(True)
+    close_btn.clicked.connect(dlg.accept)
+    btns.addWidget(copy_btn)
+    btns.addStretch(1)
+    btns.addWidget(close_btn)
+    lay.addLayout(btns)
+
+    dlg.exec()
+
+
+# --------------------------------------------------------------------------- #
 # Worker
 # --------------------------------------------------------------------------- #
 class JobWorker(QtCore.QThread):
     progress = QtCore.Signal(float, str)
     log = QtCore.Signal(str)
     file_done = QtCore.Signal(str, str)       # kind, path
+    captions = QtCore.Signal(str, list)       # video name, [(idx,start,end,orig,trans)]
     video_done = QtCore.Signal(str)           # per-video finished
     error = QtCore.Signal(str)
     finished_all = QtCore.Signal()
@@ -86,6 +136,11 @@ class JobWorker(QtCore.QThread):
                     self.progress.emit((i + p) / n, m)
 
                 result = run_job(cfg, progress_cb=pcb)
+                rows = [
+                    (s.index, s.start, s.end, s.text, s.translation)
+                    for s in result.segments
+                ]
+                self.captions.emit(os.path.basename(vid), rows)
                 for kind, path in result.files.items():
                     self.file_done.emit(kind, path)
                 self.log.emit(
@@ -249,10 +304,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setStyleSheet("color:#555;")
         root.addWidget(self.status)
 
+        # --- Results (captions table) + log, in tabs
+        self.tabs = QtWidgets.QTabWidget()
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "时间 Time", "原文 Original", "译文 Translation"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setWordWrap(True)
+        self.table.setAlternatingRowColors(True)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self.tabs.addTab(self.table, "识别字幕 / Captions")
+
         self.logview = QtWidgets.QPlainTextEdit()
         self.logview.setReadOnly(True)
-        self.logview.setMaximumHeight(150)
-        root.addWidget(self.logview)
+        self.tabs.addTab(self.logview, "日志 / Log")
+
+        root.addWidget(self.tabs, 2)
 
     # -- settings load/save -------------------------------------------------
     def _load_settings(self):
@@ -379,12 +453,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "sample_fps": self.settings["sample_fps"],
         }
         self.logview.clear()
+        self.table.setRowCount(0)
+        self.tabs.setCurrentIndex(0)
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.worker = JobWorker(list(self.videos), base, key)
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.on_log)
         self.worker.file_done.connect(self.on_file_done)
+        self.worker.captions.connect(self.on_captions)
         self.worker.error.connect(self.on_error)
         self.worker.finished_all.connect(self.on_finished)
         self.worker.start()
@@ -404,11 +481,44 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_file_done(self, kind, path):
         self.logview.appendPlainText(f"    → {kind}: {path}")
 
+    def on_captions(self, video_name, rows):
+        """Fill the results table with recognized text + translation."""
+        if self.table.rowCount() and len(self.videos) > 1:
+            self._add_section_row(video_name)
+        for idx, start, end, orig, trans in rows:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            cells = [
+                str(idx),
+                f"{_fmt_time(start)}–{_fmt_time(end)}",
+                orig,
+                trans,
+            ]
+            for c, val in enumerate(cells):
+                it = QtWidgets.QTableWidgetItem(val)
+                it.setToolTip(val)
+                if c in (0, 1):
+                    it.setTextAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+                else:
+                    it.setTextAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+                self.table.setItem(r, c, it)
+        self.table.resizeRowsToContents()
+        self.tabs.setCurrentIndex(0)
+
+    def _add_section_row(self, video_name):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        it = QtWidgets.QTableWidgetItem(f"▼ {video_name}")
+        f = it.font(); f.setBold(True); it.setFont(f)
+        it.setBackground(QtGui.QBrush(QtGui.QColor("#eef2fb")))
+        self.table.setItem(r, 0, it)
+        self.table.setSpan(r, 0, 1, 4)
+
     def on_error(self, msg):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        QtWidgets.QMessageBox.critical(self, APP_NAME, f"出错了:\n{msg}")
         self.status.setText("出错 / Error")
+        _show_error_dialog(self, msg)
 
     def on_finished(self):
         self.run_btn.setEnabled(True)

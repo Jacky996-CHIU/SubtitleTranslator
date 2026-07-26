@@ -183,27 +183,38 @@ def burn_video(
     # name. A relative name has no "/" or ":" so it sidesteps ffmpeg's brittle
     # filtergraph path-escaping (which broke on absolute paths / hidden dirs).
     ass_name = os.path.basename(ass_file)
-    sub = f"subtitles={ass_name}"
+    fonts_opt = ""
     if fonts_dir:
         fd = os.path.abspath(fonts_dir).replace("\\", "/").replace(":", "\\:")
-        sub = f"subtitles={ass_name}:fontsdir='{fd}'"
+        fonts_opt = f":fontsdir='{fd}'"
 
-    vf = sub
-    if cover_original:
-        cover = _cover_filters(segments, w, h)
-        if cover:
-            vf = cover + "," + sub
-
-    cmd = [
-        ffmpeg_path(), "-y", "-i", os.path.abspath(video_in),
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-c:a", "copy", os.path.abspath(video_out),
+    # Different ffmpeg builds disagree on how the subtitles filter accepts its
+    # filename (some require the explicit ``filename=`` key and reject the bare
+    # positional form with "No option name near ..."). Try the known-good forms
+    # in order until one succeeds, so it works across ffmpeg versions.
+    sub_variants = [
+        f"subtitles=filename={ass_name}{fonts_opt}",
+        f"subtitles={ass_name}{fonts_opt}",
+        f"subtitles='{ass_name}'{fonts_opt}",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
-    if proc.returncode != 0:
-        raise RuntimeError("ffmpeg burn failed:\n" + proc.stderr[-2000:])
-    return video_out
+
+    cover = _cover_filters(segments, w, h) if cover_original else ""
+
+    last_err = ""
+    for sub in sub_variants:
+        vf = (cover + "," + sub) if cover else sub
+        cmd = [
+            ffmpeg_path(), "-y", "-i", os.path.abspath(video_in),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "copy", os.path.abspath(video_out),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
+        if proc.returncode == 0:
+            return video_out
+        last_err = proc.stderr
+
+    raise RuntimeError("ffmpeg burn failed:\n" + last_err[-2000:])
 
 
 # --------------------------------------------------------------------------- #
