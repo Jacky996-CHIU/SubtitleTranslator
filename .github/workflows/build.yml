@@ -1,0 +1,63 @@
+name: Build desktop apps (Mac + Windows)
+
+# Produces genuine native installers for macOS and Windows automatically.
+# Push a tag like v1.0.0, or run manually from the Actions tab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+          - os: windows-latest
+            name: Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tesseract ffmpeg
+
+      - name: Install system tools (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install tesseract --no-progress -y
+          choco install ffmpeg --no-progress -y
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          export TESSDATA_PREFIX="$(brew --prefix)/share/tessdata"
+          pyinstaller build/SubtitleTranslator.spec --noconfirm --distpath dist --workpath build/_work
+          hdiutil create -volname SubtitleTranslator -srcfolder "dist/SubtitleTranslator.app" -ov -format UDZO "dist/SubtitleTranslator-macos.dmg"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller build/SubtitleTranslator.spec --noconfirm --distpath dist --workpath build/_work
+          powershell Compress-Archive -Path dist/SubtitleTranslator/* -DestinationPath dist/SubtitleTranslator-windows.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubtitleTranslator-${{ matrix.name }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
