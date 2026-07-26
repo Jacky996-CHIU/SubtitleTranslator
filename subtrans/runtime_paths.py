@@ -56,6 +56,21 @@ def find_tool(tool: str) -> str | None:
     return None
 
 
+def imageio_ffmpeg() -> str | None:
+    """Path to the ffmpeg shipped by the ``imageio-ffmpeg`` wheel, if installed.
+
+    That build is statically linked against libass, so it can render ASS/SRT
+    subtitles. Distro/Homebrew ffmpeg builds are sometimes compiled without
+    libass and then lack the ``subtitles`` filter entirely.
+    """
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        return p if p and os.path.isfile(p) else None
+    except Exception:
+        return None
+
+
 def tessdata_dir() -> str | None:
     """Bundled ``tessdata`` directory (contains ``*.traineddata``), or ``None``."""
     if not is_frozen():

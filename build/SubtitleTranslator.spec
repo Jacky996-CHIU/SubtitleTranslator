@@ -39,6 +39,18 @@ _bundle("ffmpeg")
 _bundle("ffprobe")
 tess = _bundle("tesseract")
 
+# The imageio-ffmpeg wheel ships a static ffmpeg built WITH libass, which the
+# app needs to burn subtitles (Homebrew/distro ffmpeg is sometimes built without
+# it and then has no 'subtitles' filter at all). Ship it inside the package so
+# imageio_ffmpeg.get_ffmpeg_exe() resolves it at runtime.
+try:
+    import imageio_ffmpeg
+    _iio = imageio_ffmpeg.get_ffmpeg_exe()
+    if _iio and os.path.isfile(_iio):
+        binaries.append((_iio, os.path.join("imageio_ffmpeg", "binaries")))
+except Exception:
+    pass
+
 # Tesseract language data. Prefer TESSDATA_PREFIX; otherwise infer from the
 # tesseract install layout so the packaged app is self-contained.
 datas = []
@@ -57,7 +69,7 @@ tessdata = _find_tessdata()
 if tessdata:
     datas.append((tessdata, "tessdata"))
 
-hiddenimports = collect_submodules("subtrans")
+hiddenimports = collect_submodules("subtrans") + ["imageio_ffmpeg"]
 
 a = Analysis(
     ["../gui/app.py"],

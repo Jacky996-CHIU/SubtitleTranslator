@@ -10,7 +10,7 @@ import subprocess
 from typing import List, Optional
 
 from .extractor import Segment
-from .runtime_paths import find_tool
+from .runtime_paths import find_tool, imageio_ffmpeg
 
 
 # --------------------------------------------------------------------------- #
@@ -110,10 +110,62 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # --------------------------------------------------------------------------- #
 # Burn subtitles into video (ffmpeg)
 # --------------------------------------------------------------------------- #
+def _ffmpeg_candidates() -> List[str]:
+    """All ffmpeg binaries we could use, best-known-first."""
+    cands = [
+        os.environ.get("FFMPEG_BINARY"),
+        imageio_ffmpeg(),        # pip wheel: static build WITH libass
+        find_tool("ffmpeg"),     # bundled next to the frozen app
+        shutil.which("ffmpeg"),  # system install
+    ]
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def ffmpeg_path() -> str:
-    return (os.environ.get("FFMPEG_BINARY")
-            or find_tool("ffmpeg")            # bundled binary when frozen
-            or shutil.which("ffmpeg") or "ffmpeg")
+    cands = _ffmpeg_candidates()
+    return cands[0] if cands else "ffmpeg"
+
+
+def _has_subtitles_filter(ffmpeg: str) -> bool:
+    """True if this ffmpeg build can render subtitles (i.e. was built w/ libass).
+
+    Homebrew/distro builds are sometimes compiled without libass, in which case
+    the ``subtitles`` filter is missing entirely and burning text is impossible.
+    """
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-filters"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return False
+    return any(line.split()[1:2] == ["subtitles"]
+               for line in out.splitlines() if line.strip())
+
+
+_SUBS_FFMPEG_CACHE: dict = {}
+
+
+def ffmpeg_with_subtitles() -> str:
+    """An ffmpeg that can actually burn subtitles, or raise a clear error."""
+    if "path" in _SUBS_FFMPEG_CACHE:
+        return _SUBS_FFMPEG_CACHE["path"]
+    tried = []
+    for cand in _ffmpeg_candidates():
+        tried.append(cand)
+        if _has_subtitles_filter(cand):
+            _SUBS_FFMPEG_CACHE["path"] = cand
+            return cand
+    raise RuntimeError(
+        "找不到支持字幕渲染的 ffmpeg（缺少 libass / subtitles 滤镜），无法压制视频。\n"
+        "No ffmpeg with subtitle support (libass) was found, so the video cannot "
+        "be burned.\n"
+        "解决 / Fix:  pip install imageio-ffmpeg   或安装带 libass 的 ffmpeg。\n"
+        + ("已尝试 / tried: " + ", ".join(tried) if tried else "")
+    )
 
 
 def ffprobe_path() -> str:
@@ -124,6 +176,19 @@ def ffprobe_path() -> str:
 
 
 def _probe_dims(video_in: str):
+    """Video pixel dimensions. Uses OpenCV first — ffprobe is not shipped by
+    every ffmpeg distribution (e.g. the imageio-ffmpeg wheel), and a wrong
+    fallback size would misplace the cover boxes."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_in)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
     try:
         out = subprocess.check_output([
             ffprobe_path(),
@@ -200,11 +265,13 @@ def burn_video(
 
     cover = _cover_filters(segments, w, h) if cover_original else ""
 
+    ffmpeg = ffmpeg_with_subtitles()   # raises a clear error if none can burn
+
     last_err = ""
     for sub in sub_variants:
         vf = (cover + "," + sub) if cover else sub
         cmd = [
-            ffmpeg_path(), "-y", "-i", os.path.abspath(video_in),
+            ffmpeg, "-y", "-i", os.path.abspath(video_in),
             "-vf", vf,
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
             "-c:a", "copy", os.path.abspath(video_out),
