@@ -11,8 +11,10 @@ from typing import Callable, List, Optional
 from .cache import Cache
 from .extractor import SubtitleExtractor, Segment, ExtractConfig
 from .ocr_engine import OCRConfig, build_engine
+from .encoder import describe, detect_encoder
 from .inpaint import remove_hardsubs
 from .ocr_postprocess import OCRQuality, score_captions
+from .qc import QCReport, check as qc_check
 from .style import SubtitleStyle
 from . import outputs
 
@@ -41,7 +43,9 @@ class JobConfig:
     cache_dir: Optional[str] = None
     removal_mode: str = "cover"            # cover | inpaint (PRD 八 AI 去字幕)
     style: Optional[SubtitleStyle] = None  # PRD 九 字幕样式
-    encoder: Optional[str] = None          # None = libx264, else HW encoder
+    encoder: Optional[str] = None          # None = auto-detect (GPU if usable)
+    use_gpu: bool = True                   # PRD 十五 GPU 自动检测
+    strict_qc: bool = False                # PRD 十一 检查通过后才允许导出
 
 
 @dataclass
@@ -49,6 +53,7 @@ class JobResult:
     segments: List[Segment]
     files: dict = field(default_factory=dict)
     quality: Optional[OCRQuality] = None
+    qc: Optional[QCReport] = None
     from_cache: bool = False
 
 
@@ -111,7 +116,18 @@ def run_job(
     for s in segments:
         s.translation = memo.get(s.text, "")
 
-    # 3. Outputs ------------------------------------------------------------
+    # 3. Pre-export quality check (PRD 十一) --------------------------------
+    quality = score_captions([s.text for s in segments], line_confs)
+    report(0.80, "质量检查 / Quality check")
+    dims = outputs._probe_dims(cfg.video_path)
+    qc_report = qc_check(segments, dims, target_lang=cfg.target_lang,
+                         burn_mode=cfg.burn_mode,
+                         min_conf_flagged=quality.low_conf_count)
+    if cfg.strict_qc and not qc_report.ok:
+        detail = "\n".join(str(f) for f in qc_report.errors[:12])
+        raise RuntimeError("导出前质量检查未通过 / Quality check failed:\n" + detail)
+
+    # 4. Outputs ------------------------------------------------------------
     files = {}
     tl = cfg.target_lang.replace("-", "").lower()
 
@@ -154,18 +170,22 @@ def run_job(
             audio_from = cfg.video_path      # intermediate has no audio
             cover = False                    # already removed
 
-        report(0.95, "压制视频 / Burning video")
+        # GPU 自动检测 (PRD 十五): pick the fastest encoder that really works.
+        enc = cfg.encoder
+        if enc is None:
+            enc = detect_encoder(outputs.ffmpeg_with_subtitles(),
+                                 allow_gpu=cfg.use_gpu)
+        report(0.95, f"压制视频 / Burning video · {describe(enc)}")
         outputs.burn_video(source_video, segments, vid_path, workdir,
                            mode=cfg.burn_mode, font=font,
                            font_size=cfg.burn_font_size, fonts_dir=fonts_dir,
                            cover_original=cover, style=style,
-                           audio_from=audio_from, encoder=cfg.encoder)
+                           audio_from=audio_from, encoder=enc)
         files["video"] = vid_path
 
     report(1.0, "完成 / Done")
-    quality = score_captions([s.text for s in segments], line_confs)
     return JobResult(segments=segments, files=files, quality=quality,
-                     from_cache=from_cache)
+                     qc=qc_report, from_cache=from_cache)
 
 
 def _default_cjk_font() -> str:
