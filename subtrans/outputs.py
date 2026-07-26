@@ -179,10 +179,14 @@ def burn_video(
     write_ass(segments, ass_file, mode=mode, font=font, font_size=fs,
               play_res_x=w, play_res_y=h)
 
-    ass_esc = ass_file.replace("\\", "/").replace(":", "\\:")
-    sub = f"subtitles='{ass_esc}'"
+    # Run ffmpeg from the workdir and reference the subtitle file by its bare
+    # name. A relative name has no "/" or ":" so it sidesteps ffmpeg's brittle
+    # filtergraph path-escaping (which broke on absolute paths / hidden dirs).
+    ass_name = os.path.basename(ass_file)
+    sub = f"subtitles={ass_name}"
     if fonts_dir:
-        sub = f"subtitles='{ass_esc}':fontsdir='{fonts_dir}'"
+        fd = os.path.abspath(fonts_dir).replace("\\", "/").replace(":", "\\:")
+        sub = f"subtitles={ass_name}:fontsdir='{fd}'"
 
     vf = sub
     if cover_original:
@@ -191,12 +195,12 @@ def burn_video(
             vf = cover + "," + sub
 
     cmd = [
-        ffmpeg_path(), "-y", "-i", video_in,
+        ffmpeg_path(), "-y", "-i", os.path.abspath(video_in),
         "-vf", vf,
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-c:a", "copy", video_out,
+        "-c:a", "copy", os.path.abspath(video_out),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg burn failed:\n" + proc.stderr[-2000:])
     return video_out
