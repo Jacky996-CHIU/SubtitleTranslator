@@ -24,9 +24,12 @@ live (region), how large they are, and brightness of the text.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import List
+
+from .runtime_paths import find_tool, tessdata_dir
 
 import cv2
 import numpy as np
@@ -97,6 +100,15 @@ class TesseractOCR(BaseOCR):
         super().__init__(config)
         self.lang = lang
         import pytesseract  # imported here so the module import stays cheap
+
+        # When frozen, use the ffmpeg/tesseract binaries bundled inside the app
+        # so end users don't need to install anything.
+        tcmd = find_tool("tesseract")
+        if tcmd:
+            pytesseract.pytesseract.tesseract_cmd = tcmd
+        tdir = tessdata_dir()
+        if tdir:
+            os.environ.setdefault("TESSDATA_PREFIX", tdir)
 
         self._tess = pytesseract
 

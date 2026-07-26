@@ -10,6 +10,7 @@ import subprocess
 from typing import List, Optional
 
 from .extractor import Segment
+from .runtime_paths import find_tool
 
 
 # --------------------------------------------------------------------------- #
@@ -110,13 +111,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 # Burn subtitles into video (ffmpeg)
 # --------------------------------------------------------------------------- #
 def ffmpeg_path() -> str:
-    return os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg") or "ffmpeg"
+    return (os.environ.get("FFMPEG_BINARY")
+            or find_tool("ffmpeg")            # bundled binary when frozen
+            or shutil.which("ffmpeg") or "ffmpeg")
+
+
+def ffprobe_path() -> str:
+    return (os.environ.get("FFPROBE_BINARY")
+            or find_tool("ffprobe")           # bundled binary when frozen
+            or shutil.which("ffprobe")
+            or ffmpeg_path().replace("ffmpeg", "ffprobe"))
 
 
 def _probe_dims(video_in: str):
     try:
         out = subprocess.check_output([
-            ffmpeg_path().replace("ffmpeg", "ffprobe"),
+            ffprobe_path(),
             "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=width,height",
             "-of", "csv=p=0:s=x", video_in,
