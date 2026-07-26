@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from .ocr_engine import BaseOCR, OCRConfig, build_engine
+from .ocr_postprocess import correct_text, dedupe_lines
 
 
 @dataclass
@@ -179,6 +180,13 @@ class SubtitleExtractor:
             box = self._union_box(g["boxes"])
             segs.append(Segment(0, round(g["start"], 2), round(g["end"], 2), text,
                                 orig_box=box))
+
+        # De-duplicate repeated lines inside one caption and fix common OCR
+        # confusions (PRD: 去重 / OCR 自动纠错).
+        for s in segs:
+            lines = dedupe_lines([l for l in s.text.split("\n") if l.strip()])
+            s.text = correct_text("\n".join(lines))
+        segs = [s for s in segs if _norm(s.text)]
 
         # merge adjacent segments with the same voted text (fixes brief gaps)
         merged: List[Segment] = []

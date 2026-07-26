@@ -8,8 +8,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from .cache import Cache
 from .extractor import SubtitleExtractor, Segment, ExtractConfig
 from .ocr_engine import OCRConfig, build_engine
+from .ocr_postprocess import OCRQuality, score_captions
 from . import outputs
 
 
@@ -33,12 +35,16 @@ class JobConfig:
     burn_font_size: Optional[int] = None   # 压制字号(px)，None=按视频高度自动
     fonts_dir: Optional[str] = None
     sample_fps: float = 4.0
+    use_cache: bool = True                 # PRD 十三: 改样式不得重跑 OCR/DeepL
+    cache_dir: Optional[str] = None
 
 
 @dataclass
 class JobResult:
     segments: List[Segment]
     files: dict = field(default_factory=dict)
+    quality: Optional[OCRQuality] = None
+    from_cache: bool = False
 
 
 def run_job(
@@ -55,30 +61,50 @@ def run_job(
     workdir = os.path.join(cfg.out_dir, f".{base}_work")
     os.makedirs(workdir, exist_ok=True)
 
-    # 1. Extract ------------------------------------------------------------
-    report(0.02, "初始化识别引擎 / Init OCR")
-    engine = build_engine(cfg.ocr_engine, OCRConfig())
-    extractor = SubtitleExtractor(engine=engine,
-                                  config=ExtractConfig(sample_fps=cfg.sample_fps))
-    segments = extractor.extract(
-        cfg.video_path,
-        progress_cb=lambda p, m: report(0.02 + 0.58 * p, m),
-    )
-    if not segments:
-        raise RuntimeError("未识别到任何字幕 / No captions detected.")
+    cache = Cache(cfg.cache_dir, enabled=cfg.use_cache)
 
-    # 2. Translate ----------------------------------------------------------
+    # 1. Extract (cached) ---------------------------------------------------
+    ocr_key = cache.ocr_key(cfg.video_path, cfg.ocr_engine, cfg.sample_fps)
+    cached = cache.get_ocr(ocr_key)
+    line_confs: List[float] = []
+    from_cache = False
+    if cached:
+        report(0.55, "读取 OCR 缓存 / OCR cache hit")
+        segments = [Segment(**{**d, "orig_box": tuple(d["orig_box"])
+                              if d.get("orig_box") else None}) for d in cached]
+        from_cache = True
+    else:
+        report(0.02, "初始化识别引擎 / Init OCR")
+        engine = build_engine(cfg.ocr_engine, OCRConfig())
+        extractor = SubtitleExtractor(engine=engine,
+                                      config=ExtractConfig(sample_fps=cfg.sample_fps))
+        segments = extractor.extract(
+            cfg.video_path,
+            progress_cb=lambda p, m: report(0.02 + 0.58 * p, m),
+        )
+        if not segments:
+            raise RuntimeError("未识别到任何字幕 / No captions detected.")
+        line_confs = list(getattr(engine, "last_confidences", []))
+        cache.put_ocr(ocr_key, segments)
+
+    # 2. Translate (cached per source line) ---------------------------------
     if translator is None:
         from .translate import DeepLTranslator
         translator = DeepLTranslator(cfg.api_key)
     report(0.62, "翻译中 / Translating")
+    tkey = cache.translate_key(cfg.target_lang, cfg.source_lang)
+    memo = cache.get_translations(tkey)
     texts = [s.text for s in segments]
-    translations = translator.translate_lines(
-        texts, cfg.target_lang, source_lang=cfg.source_lang,
-        progress_cb=lambda p, m: report(0.62 + 0.18 * p, m),
-    )
-    for s, tr in zip(segments, translations):
-        s.translation = tr
+    todo = [t for t in dict.fromkeys(texts) if t and t not in memo]
+    if todo:
+        fresh = translator.translate_lines(
+            todo, cfg.target_lang, source_lang=cfg.source_lang,
+            progress_cb=lambda p, m: report(0.62 + 0.18 * p, m),
+        )
+        memo.update({src: tr for src, tr in zip(todo, fresh)})
+        cache.put_translations(tkey, memo)
+    for s in segments:
+        s.translation = memo.get(s.text, "")
 
     # 3. Outputs ------------------------------------------------------------
     files = {}
@@ -111,7 +137,9 @@ def run_job(
         files["video"] = vid_path
 
     report(1.0, "完成 / Done")
-    return JobResult(segments=segments, files=files)
+    quality = score_captions([s.text for s in segments], line_confs)
+    return JobResult(segments=segments, files=files, quality=quality,
+                     from_cache=from_cache)
 
 
 def _default_cjk_font() -> str:
