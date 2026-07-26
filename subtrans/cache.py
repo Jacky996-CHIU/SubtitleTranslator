@@ -87,15 +87,19 @@ class Cache:
                 extra: str = "") -> str:
         return _hash(video_fingerprint(video_path), engine, sample_fps, extra)
 
-    def get_ocr(self, key: str) -> Optional[List[dict]]:
+    def get_ocr(self, key: str) -> Optional[dict]:
         data = self._read("ocr", key)
         if isinstance(data, dict) and isinstance(data.get("segments"), list):
-            return data["segments"]
+            return data
         return None
 
-    def put_ocr(self, key: str, segments) -> None:
-        self._write("ocr", key, {"version": 1,
-                                 "segments": [asdict(s) for s in segments]})
+    def put_ocr(self, key: str, segments, cover_windows=None) -> None:
+        self._write("ocr", key, {
+            "version": 2,
+            "segments": [asdict(s) for s in segments],
+            "cover_windows": [[a, b, list(box)]
+                              for (a, b, box) in (cover_windows or [])],
+        })
 
     # -- translation --------------------------------------------------------
     def translate_key(self, target_lang: str, source_lang: str) -> str:

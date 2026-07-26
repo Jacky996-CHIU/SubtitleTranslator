@@ -78,6 +78,7 @@ def write_ass(
     position_at_original: bool = True,
     shadow: int = 1,
     force_bottom_top: bool = False,
+    boxes: Optional[dict] = None,
 ) -> str:
     """Write an ASS subtitle file.
 
@@ -112,8 +113,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         body = body.replace("\n", "\\N")
 
         tags = ""
-        if position_at_original and s.orig_box and not force_bottom_top:
-            bx, by, bw, bh = s.orig_box
+        box = (boxes or {}).get(s.index) or s.orig_box
+        if position_at_original and box and not force_bottom_top:
+            bx, by, bw, bh = box
             cx, cy = int(bx + bw / 2), int(by + bh / 2)
             nlines = body.count("\\N") + 1
             # Scale the text to the original caption's height so it reads like a
@@ -224,16 +226,41 @@ def _probe_dims(video_in: str):
         return 640, 360
 
 
-def _cover_filters(segments: List[Segment], w: int, h: int, pad: int = 6) -> str:
-    """drawbox filters that mask each original caption for its time range."""
+def _cover_filters(segments: List[Segment], w: int, h: int, pad: int = 10,
+                   boxes: Optional[dict] = None) -> str:
+    """drawbox filters that mask each original caption for its time range.
+
+    ``boxes`` optionally supplies per-caption boxes measured from the video
+    itself (see :mod:`subtrans.cover`); those cover the full extent of the
+    original text, whereas ``Segment.orig_box`` is a median that can leave
+    wider frames poking out.
+    """
     parts = []
     for s in segments:
-        if not s.orig_box:
+        box = (boxes or {}).get(s.index) or s.orig_box
+        if not box:
             continue
-        x, y, bw, bh = s.orig_box
+        x, y, bw, bh = box
         x = max(0, x - pad); y = max(0, y - pad)
         bw = min(w - x, bw + 2 * pad); bh = min(h - y, bh + 2 * pad)
         st, en = s.start, s.end
+        parts.append(
+            f"drawbox=x={x}:y={y}:w={bw}:h={bh}:color=black@1.0:t=fill:"
+            f"enable='between(t,{st:.2f},{en:.2f})'"
+        )
+    return ",".join(parts)
+
+
+def _window_cover_filters(windows, w: int, h: int, pad: int = 8) -> str:
+    """drawbox filters for scan-measured (start, end, box) mask windows."""
+    parts = []
+    for (st, en, (x, y, bw, bh)) in windows:
+        x = max(0, x - pad)
+        y = max(0, y - pad)
+        bw = min(w - x, bw + 2 * pad)
+        bh = min(h - y, bh + 2 * pad)
+        if bw <= 0 or bh <= 0:
+            continue
         parts.append(
             f"drawbox=x={x}:y={y}:w={bw}:h={bh}:color=black@1.0:t=fill:"
             f"enable='between(t,{st:.2f},{en:.2f})'"
@@ -255,6 +282,7 @@ def burn_video(
     style=None,
     audio_from: Optional[str] = None,
     encoder: Optional[str] = None,
+    cover_windows: Optional[list] = None,
 ) -> str:
     """Render a new MP4 with the (translated) captions burned in.
 
@@ -269,6 +297,16 @@ def burn_video(
     w, h = _probe_dims(video_in)
     ass_file = os.path.join(workdir, "burn.ass")
 
+    # Measure the true extent of each source caption once: the black mask must
+    # cover all of it, and the replacement text is centred on that same box.
+    measured = None
+    if cover_original:
+        try:
+            from .cover import refine_cover_boxes
+            measured = refine_cover_boxes(video_in, segments)
+        except Exception:
+            measured = None
+
     if style is not None:
         fs = style.resolved_font_size(h)
         write_ass(segments, ass_file, mode=mode,
@@ -280,11 +318,12 @@ def burn_video(
                   bold=-1 if style.bold else 0,
                   alignment=style.alignment, margin_v=style.margin_v,
                   position_at_original=(style.position == "original"),
-                  force_bottom_top=(style.position != "original"))
+                  force_bottom_top=(style.position != "original"),
+                  boxes=measured)
     else:
         fs = font_size or max(18, int(h * 0.062))
         write_ass(segments, ass_file, mode=mode, font=font, font_size=fs,
-                  play_res_x=w, play_res_y=h)
+                  play_res_x=w, play_res_y=h, boxes=measured)
 
     # Run ffmpeg from the workdir and reference the subtitle file by its bare
     # name. A relative name has no "/" or ":" so it sidesteps ffmpeg's brittle
@@ -305,7 +344,15 @@ def burn_video(
         f"subtitles='{ass_name}'{fonts_opt}",
     ]
 
-    cover = _cover_filters(segments, w, h) if cover_original else ""
+    cover = ""
+    if cover_original:
+        # Prefer per-frame windows built from the boxes OCR itself accepted:
+        # they cover every line that was on screen at that moment, even when the
+        # lines ended up in segments with different time ranges.
+        if cover_windows:
+            cover = _window_cover_filters(cover_windows, w, h)
+        else:
+            cover = _cover_filters(segments, w, h, boxes=measured)
 
     ffmpeg = ffmpeg_with_subtitles()   # raises a clear error if none can burn
 

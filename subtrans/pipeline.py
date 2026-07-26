@@ -77,11 +77,15 @@ def run_job(
     ocr_key = cache.ocr_key(cfg.video_path, cfg.ocr_engine, cfg.sample_fps)
     cached = cache.get_ocr(ocr_key)
     line_confs: List[float] = []
+    cover_windows: List[tuple] = []
     from_cache = False
     if cached:
         report(0.55, "读取 OCR 缓存 / OCR cache hit")
         segments = [Segment(**{**d, "orig_box": tuple(d["orig_box"])
-                              if d.get("orig_box") else None}) for d in cached]
+                              if d.get("orig_box") else None})
+                    for d in cached["segments"]]
+        cover_windows = [(a, b, tuple(box))
+                         for a, b, box in cached.get("cover_windows", [])]
         from_cache = True
     else:
         report(0.02, "初始化识别引擎 / Init OCR")
@@ -95,7 +99,8 @@ def run_job(
         if not segments:
             raise RuntimeError("未识别到任何字幕 / No captions detected.")
         line_confs = list(getattr(engine, "last_confidences", []))
-        cache.put_ocr(ocr_key, segments)
+        cover_windows = list(getattr(extractor, "cover_windows", []))
+        cache.put_ocr(ocr_key, segments, cover_windows)
 
     # 2. Translate (cached per source line) ---------------------------------
     if translator is None:
@@ -180,7 +185,8 @@ def run_job(
                            mode=cfg.burn_mode, font=font,
                            font_size=cfg.burn_font_size, fonts_dir=fonts_dir,
                            cover_original=cover, style=style,
-                           audio_from=audio_from, encoder=enc)
+                           audio_from=audio_from, encoder=enc,
+                           cover_windows=cover_windows)
         files["video"] = vid_path
 
     report(1.0, "完成 / Done")
