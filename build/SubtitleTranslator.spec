@@ -18,21 +18,43 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 ROOT = os.path.abspath(os.getcwd())
 
+import glob
+
 binaries = []
-def _bundle(tool, dest):
+def _bundle(tool, dest="."):
     p = shutil.which(tool)
-    if p:
-        binaries.append((p, dest))
+    if not p:
+        return None
+    binaries.append((p, dest))
+    # On Windows the tool's shared libraries (e.g. Tesseract's leptonica DLLs)
+    # sit next to the .exe and must ship with it. PyInstaller traces most, but
+    # grab the siblings explicitly to be safe.
+    if os.name == "nt":
+        for dll in glob.glob(os.path.join(os.path.dirname(p), "*.dll")):
+            binaries.append((dll, dest))
+    return p
 
 # Best-effort bundling of external tools.
-_bundle("ffmpeg", ".")
-_bundle("ffprobe", ".")
-_bundle("tesseract", ".")
+_bundle("ffmpeg")
+_bundle("ffprobe")
+tess = _bundle("tesseract")
 
-# Tesseract language data (eng) if discoverable.
+# Tesseract language data. Prefer TESSDATA_PREFIX; otherwise infer from the
+# tesseract install layout so the packaged app is self-contained.
 datas = []
-tessdata = os.environ.get("TESSDATA_PREFIX")
-if tessdata and os.path.isdir(tessdata):
+def _find_tessdata():
+    env = os.environ.get("TESSDATA_PREFIX")
+    if env and os.path.isdir(env):
+        return env
+    if tess:
+        base = os.path.dirname(os.path.dirname(tess))  # <prefix>/bin/tesseract
+        for cand in (os.path.join(base, "share", "tessdata"),
+                     os.path.join(os.path.dirname(tess), "tessdata")):
+            if os.path.isdir(cand):
+                return cand
+    return None
+tessdata = _find_tessdata()
+if tessdata:
     datas.append((tessdata, "tessdata"))
 
 hiddenimports = collect_submodules("subtrans")

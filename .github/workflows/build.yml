@@ -50,7 +50,9 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
+          export TESSDATA_PREFIX="/c/Program Files/Tesseract-OCR/tessdata"
           pyinstaller build/SubtitleTranslator.spec --noconfirm --distpath dist --workpath build/_work
           powershell Compress-Archive -Path dist/SubtitleTranslator/* -DestinationPath dist/SubtitleTranslator-windows.zip
 
