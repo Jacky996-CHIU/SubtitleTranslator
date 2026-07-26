@@ -16,6 +16,22 @@ python3 cli.py VIDEO --extract-only --out ./out  # 只识别原文,不翻译(免
 python3 tests/test_deepl_integration.py          # DeepL 接入离线测试(6项)
 ```
 
+## 模块（PRD 十八 模块化）
+
+| 模块 | 文件 | 说明 |
+|------|------|------|
+| 视频导入 / UI | `gui/app.py` | PRD 流程：导入→语言→样式→处理→预览→导出 |
+| 实时预览 | `gui/preview.py` | 播放/拖动 + 按当前样式重绘（不重跑 OCR/翻译） |
+| 样式编辑 | `gui/style_panel.py`, `subtrans/style.py` | 字体/字号/颜色/描边/阴影/背景/位置 |
+| OCR | `subtrans/ocr_engine.py`, `extractor.py` | 二次识别、逐词置信度、每帧重识别 |
+| OCR 后处理 | `subtrans/ocr_postprocess.py` | 去重、上下文纠错、质量评分 |
+| 翻译 | `subtrans/translate.py` | DeepL；相同文本不重复调用 |
+| 去字幕 | `subtrans/cover.py`（黑底遮盖，默认）、`inpaint.py`（重绘，可选） | 黑底窗口来自 OCR 每帧验证过的行框 |
+| 渲染/导出 | `subtrans/outputs.py` | ASS + ffmpeg；保持分辨率/帧率/音频 |
+| 缓存 | `subtrans/cache.py` | OCR 与翻译缓存；改样式只重渲染 |
+| 质量检查 | `subtrans/qc.py` | 导出前 OCR/翻译/字幕/去字幕四类检查 |
+| GPU | `subtrans/encoder.py` | VideoToolbox/NVENC/QSV/AMF，试编码确认 |
+
 ## 架构（数据流）
 
 `gui/app.py` 或 `cli.py`
@@ -60,6 +76,18 @@ python3 tests/test_deepl_integration.py          # DeepL 接入离线测试(6项
 - 本机构建: `build/build_win.bat`(Win) / `bash build/build_mac.sh`(mac)
 - 自动双平台: 推 tag → `.github/workflows/build.yml` 产出 `.dmg` + `.exe`
 - PyInstaller 配置: `build/SubtitleTranslator.spec`（会尝试把 ffmpeg/tesseract 一并打包）
+
+## 易踩坑（已修，勿回退）
+
+- **ffmpeg 必须带 libass**：Homebrew 的 ffmpeg 可能没编 libass，`subtitles` 滤镜
+  根本不存在 → 压制永远失败。`outputs.ffmpeg_with_subtitles()` 会挑一个真正
+  具备该滤镜的 ffmpeg（优先 `imageio-ffmpeg` 的静态版），否则报明确错误。
+- **不要复用相邻帧的 OCR 结果**：`ExtractConfig.reuse_similar_frames=False`。
+  开启会让淡入帧的残缺识别污染整条字幕，导致整行永久丢失。
+- **黑底要用每帧的行框并集**，不是分段中位数框：多行字幕的行可能被分到不同
+  时间段的 segment，用中位数框会漏挡（`extractor._build_cover_windows`）。
+- **不要用亮度阈值扫描画面找字幕**来生成黑底：白色物体/仪表屏会被当成文字，
+  黑底会膨胀到占屏近一半。
 
 ## 约束
 
